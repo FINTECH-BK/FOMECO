@@ -134,7 +134,7 @@
         <div class="field"><label>Hoặc nhập nội dung QR</label>
           <div class="row" style="flex-wrap:nowrap">
             <div class="input-wrap has-prefix" style="flex:1"><span class="prefix">${icon('scan-line')}</span>
-              <input class="input" id="qr-text" placeholder="Ví dụ: VB-6204|NL-01" data-testid="qr-input" autocomplete="off" autocapitalize="characters"></div>
+              <input class="input" id="qr-text" placeholder="Ví dụ: 1.2.01.0106|NVT" data-testid="qr-input" autocomplete="off" autocapitalize="characters"></div>
             <button class="btn" id="qr-ok">${icon('check')} Xác nhận</button>
           </div>
           <div class="help">Dùng máy quét cầm tay (tự gõ vào ô) hoặc nhập tay rồi nhấn Enter.</div>
@@ -186,24 +186,48 @@
       } catch (err) { explainError(err); }
     }
 
-    // Bước 2: bật camera sau và quét liên tục
-    function startScan() {
+    // Bước 2: bật camera sau và quét liên tục.
+    // Mức 0: độ phân giải cao + tự lấy nét liên tục (đọc được cả mã QR hiển thị trên màn hình máy tính/điện thoại khác).
+    // Mức 1: cấu hình tối giản, dùng khi máy không hỗ trợ mức 0.
+    function startScan(level = 0) {
       if (stopped) return;
       if (!window.Html5Qrcode) return fail('Chưa tải được bộ quét QR', 'Kiểm tra kết nối mạng rồi tải lại trang, hoặc nhập nội dung mã QR ở ô bên dưới.', true);
       show(`${icon('loader-circle', 'ic-xl')}<div>Đang mở camera...</div>`);
+      const F = window.Html5QrcodeSupportedFormats;
+      const video = level === 0
+        ? { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 }, advanced: [{ focusMode: 'continuous' }] }
+        : { facingMode: 'environment' };
       try {
-        scanner = new window.Html5Qrcode('qr-reader', { verbose: false });
+        scanner = new window.Html5Qrcode('qr-reader', {
+          verbose: false,
+          formatsToSupport: F ? [F.QR_CODE] : undefined,                  // chỉ tìm mã QR → nhanh hơn
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },  // dùng bộ đọc mã sẵn có của điện thoại (Android)
+        });
         scanner.start({ facingMode: 'environment' }, {
-          fps: 10, aspectRatio: 1.333,
-          qrbox: (w, h) => { const s = Math.max(160, Math.floor(Math.min(w, h) * 0.7)); return { width: s, height: s }; },
+          fps: 15,
+          videoConstraints: video,
+          qrbox: (w, h) => { const s = Math.max(200, Math.floor(Math.min(w, h) * 0.85)); return { width: s, height: s }; },
         }, (text) => {
           const now = Date.now();
           if (text === last && now - lastAt < 2500) return;
           last = text; lastAt = now;
           if (navigator.vibrate) navigator.vibrate(80);
           handle(text);
-        }).then(() => { saveCamOk(true); if (stopped) stop(); else msg.classList.add('hidden'); })
-          .catch((err) => { scanner = null; explainError(err); });
+        }).then(() => {
+          saveCamOk(true);
+          if (stopped) return stop();
+          msg.classList.add('hidden');
+          // Một số máy chỉ nhận lệnh lấy nét sau khi camera đã chạy
+          try { scanner.applyVideoConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {}); } catch (e) { /* máy không hỗ trợ */ }
+        }).catch((err) => {
+          const s = scanner; scanner = null;
+          const denied = /NotAllowed|Permission|denied/i.test(((err && (err.name || err)) || '') + '');
+          if (level === 0 && !denied) {                                   // máy không đáp ứng cấu hình cao → thử cấu hình tối giản
+            try { if (s) s.clear(); } catch (e) { /* bỏ qua */ }
+            return startScan(1);
+          }
+          explainError(err);
+        });
       } catch (err) { explainError(err); }
     }
 
