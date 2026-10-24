@@ -142,7 +142,10 @@
       footer: `<button class="btn btn-outline" data-close>${icon('x')} Đóng</button>`,
       onClose: () => stop(),
     });
-    let scanner = null, last = '', lastAt = 0, stopped = false;
+    let stream = null, timer = null, detector = null, pass = 0, last = '', lastAt = 0, stopped = false;
+    const reader = m.el.querySelector('#qr-reader');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const input = m.el.querySelector('#qr-text');
     const msg = m.el.querySelector('#scan-msg');
     const show = (html) => { msg.classList.remove('hidden'); msg.innerHTML = html; refreshIcons(); };
@@ -153,7 +156,8 @@
     m.el.querySelector('#qr-ok').addEventListener('click', submit);
     function stop() {
       stopped = true;
-      if (scanner) { const s = scanner; scanner = null; s.stop().then(() => s.clear()).catch(() => {}); }
+      clearTimeout(timer); timer = null;
+      if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
     }
 
     const fail = (title, detail, retry) => show(`${icon('camera-off', 'ic-xl')}<div class="bold">${title}</div>
@@ -186,49 +190,81 @@
       } catch (err) { explainError(err); }
     }
 
-    // Bước 2: bật camera sau và quét liên tục.
-    // Mức 0: độ phân giải cao + tự lấy nét liên tục (đọc được cả mã QR hiển thị trên màn hình máy tính/điện thoại khác).
-    // Mức 1: cấu hình tối giản, dùng khi máy không hỗ trợ mức 0.
-    function startScan(level = 0) {
+    // Bước 2: bật camera sau, tự đọc mã QR từ hình camera ở độ phân giải đầy đủ.
+    // Dùng bộ đọc mã sẵn có của trình duyệt (Android Chrome) nếu có, nếu không dùng jsQR (chạy tốt trên iPhone Safari).
+    async function openCamera() {
+      const tries = [
+        { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        { facingMode: { ideal: 'environment' } },
+      ];
+      let err;
+      for (const video of tries) {
+        try { return await navigator.mediaDevices.getUserMedia({ video, audio: false }); }
+        catch (e) { err = e; if (/NotAllowed|Security/i.test(e && e.name)) break; }
+      }
+      throw err;
+    }
+    async function startScan() {
       if (stopped) return;
-      if (!window.Html5Qrcode) return fail('Chưa tải được bộ quét QR', 'Kiểm tra kết nối mạng rồi tải lại trang, hoặc nhập nội dung mã QR ở ô bên dưới.', true);
+      if (!window.jsQR && !('BarcodeDetector' in window)) return fail('Chưa tải được bộ quét QR', 'Kiểm tra kết nối mạng rồi tải lại trang, hoặc nhập nội dung mã QR ở ô bên dưới.', true);
       show(`${icon('loader-circle', 'ic-xl')}<div>Đang mở camera...</div>`);
-      const F = window.Html5QrcodeSupportedFormats;
-      const video = level === 0
-        ? { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 }, advanced: [{ focusMode: 'continuous' }] }
-        : { facingMode: 'environment' };
       try {
-        scanner = new window.Html5Qrcode('qr-reader', {
-          verbose: false,
-          formatsToSupport: F ? [F.QR_CODE] : undefined,                  // chỉ tìm mã QR → nhanh hơn
-          experimentalFeatures: { useBarCodeDetectorIfSupported: true },  // dùng bộ đọc mã sẵn có của điện thoại (Android)
-        });
-        scanner.start({ facingMode: 'environment' }, {
-          fps: 15,
-          videoConstraints: video,
-          qrbox: (w, h) => { const s = Math.max(200, Math.floor(Math.min(w, h) * 0.85)); return { width: s, height: s }; },
-        }, (text) => {
-          const now = Date.now();
-          if (text === last && now - lastAt < 2500) return;
-          last = text; lastAt = now;
-          if (navigator.vibrate) navigator.vibrate(80);
-          handle(text);
-        }).then(() => {
-          saveCamOk(true);
-          if (stopped) return stop();
-          msg.classList.add('hidden');
-          // Một số máy chỉ nhận lệnh lấy nét sau khi camera đã chạy
-          try { scanner.applyVideoConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {}); } catch (e) { /* máy không hỗ trợ */ }
-        }).catch((err) => {
-          const s = scanner; scanner = null;
-          const denied = /NotAllowed|Permission|denied/i.test(((err && (err.name || err)) || '') + '');
-          if (level === 0 && !denied) {                                   // máy không đáp ứng cấu hình cao → thử cấu hình tối giản
-            try { if (s) s.clear(); } catch (e) { /* bỏ qua */ }
-            return startScan(1);
-          }
-          explainError(err);
-        });
-      } catch (err) { explainError(err); }
+        stream = await openCamera();
+        if (stopped) { stream.getTracks().forEach((t) => t.stop()); stream = null; return; }
+        const track = stream.getVideoTracks()[0];
+        try { await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }); } catch (e) { /* máy không hỗ trợ */ }
+        reader.innerHTML = '<video playsinline muted autoplay></video><div class="scan-frame"></div>';
+        const video = reader.querySelector('video');
+        video.muted = true;
+        video.srcObject = stream;
+        await video.play();
+        saveCamOk(true);
+        msg.classList.add('hidden');
+        if ('BarcodeDetector' in window) {
+          try {
+            const formats = await window.BarcodeDetector.getSupportedFormats();
+            if (formats.includes('qr_code')) detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+          } catch (e) { detector = null; }
+        }
+        loop(video);
+      } catch (err) {
+        if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+        explainError(err);
+      }
+    }
+    function found(text) {
+      const now = Date.now();
+      if (text === last && now - lastAt < 2500) return;
+      last = text; lastAt = now;
+      if (navigator.vibrate) navigator.vibrate(80);
+      handle(text);
+    }
+    // Mỗi khung hình thử một cấu hình (vùng cắt giữa khung × kích thước ảnh đưa vào bộ đọc).
+    // Xoay vòng 7 cấu hình → mã QR ở gần, ở xa, nghiêng, mờ hay có vân màn hình đều đọc được trong vài khung hình.
+    const COMBOS = [[0.6, 640], [0.85, 480], [1, 480], [0.6, 900], [0.85, 900], [0.6, 360], [1, 640]];
+    function decode(video) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      if (!vw || !vh) return null;
+      const [k, target] = COMBOS[pass % COMBOS.length];
+      pass += 1;
+      const sw = k === 1 ? vw : Math.min(vw, vh) * k;
+      const sh = k === 1 ? vh : Math.min(vw, vh) * k;
+      const scale = Math.min(1, target / Math.max(sw, sh));
+      canvas.width = Math.round(sw * scale); canvas.height = Math.round(sh * scale);
+      ctx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, canvas.width, canvas.height);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const r = window.jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+      return r && r.data ? r.data : null;
+    }
+    async function loop(video) {
+      if (stopped || !stream) return;
+      try {
+        let text = null;
+        if (detector) { const codes = await detector.detect(video); if (codes.length) text = codes[0].rawValue; }
+        if (!text && window.jsQR) text = decode(video);
+        if (text) found(text);
+      } catch (e) { /* bỏ qua khung hình lỗi */ }
+      timer = setTimeout(() => loop(video), 60);
     }
 
     async function begin() {
